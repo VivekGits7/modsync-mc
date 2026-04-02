@@ -1,0 +1,18 @@
+# Environment variables (contains secrets)
+.env
+
+# Auto-generated state files
+.updater-state.json
+database.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+Icon?
+
+# Claude Code
+.claude/

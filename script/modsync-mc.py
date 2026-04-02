@@ -42,8 +42,8 @@ from typing import Optional
 import aiohttp
 from dotenv import load_dotenv
 
-# Load .env from the same directory as this script
-load_dotenv(Path(__file__).parent / ".env")
+# Load .env from the project root (one level up from script/)
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # ==================== CONFIG ====================
 
