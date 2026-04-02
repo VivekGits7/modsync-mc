@@ -105,7 +105,6 @@ RESOURCE_PACKS = [
     "new-glowing-ores",
     "3d-crops",
     "rays-3d-rails",
-    "better-lanterns",
     "rays-3d-ladders",
     "vvi",
     "3d-mace!",
@@ -218,6 +217,16 @@ def save_run_to_db(
 
 # ==================== HELPERS ====================
 
+def is_version_downgrade(old_ver: str, new_ver: str) -> bool:
+    """Compare version strings to detect if new_ver is older than old_ver."""
+    def parse(v: str) -> tuple:
+        # Extract numeric parts from version string (e.g. "0.145.2+26.1.1" → [0,145,2])
+        nums = re.findall(r"\d+", v.split("+")[0])
+        return tuple(int(n) for n in nums) if nums else ()
+    old, new = parse(old_ver), parse(new_ver)
+    return bool(old and new and new < old)
+
+
 def sha1_file(path: Path) -> str:
     h = hashlib.sha1()
     with open(path, "rb") as f:
@@ -291,16 +300,19 @@ async def resolve_priority_ids(session: aiohttp.ClientSession) -> dict[str, set[
     Returns {"high": {id1, id2}, "medium": {id3}, "low": {id4}}.
     """
     resolved: dict[str, set[str]] = {"high": set(), "medium": set(), "low": set()}
-    all_slugs = {
-        slug: tier
+    all_slugs = [
+        (slug, tier)
         for tier in ("high", "medium", "low")
         for slug in MOD_PRIORITY.get(tier, [])
-    }
-    for slug, tier in all_slugs.items():
-        info = await get_project(session, slug)
-        if info:
+    ]
+    # Fetch all project info in parallel (connector limit handles concurrency)
+    results = await asyncio.gather(
+        *(get_project(session, slug) for slug, _ in all_slugs),
+        return_exceptions=True,
+    )
+    for (_, tier), info in zip(all_slugs, results):
+        if isinstance(info, dict) and "id" in info:
             resolved[tier].add(info["id"])
-        await asyncio.sleep(0.1)
     return resolved
 
 
@@ -334,28 +346,44 @@ async def bulk_check_updates(
         return {}
 
 
+async def bulk_identify_hashes(
+    session: aiohttp.ClientSession,
+    hashes: list[str],
+) -> dict[str, dict]:
+    """Identify multiple files by hash in one API call.
+    Returns {hash: version_data} for all recognized files."""
+    if not hashes:
+        return {}
+    async with session.post(
+        f"{MODRINTH_API}/version_files",
+        json={"hashes": hashes, "algorithm": "sha1"},
+    ) as resp:
+        if resp.status == 200:
+            return await resp.json()
+        return {}
+
+
 async def identify_file_by_hash(
     session: aiohttp.ClientSession,
     file_hash: str,
 ) -> Optional[str]:
-    async with session.get(
-        f"{MODRINTH_API}/version_file/{file_hash}",
-        params={"algorithm": "sha1"},
-    ) as resp:
-        if resp.status == 200:
-            data = await resp.json()
-            return data.get("project_id")
-        return None
+    """Identify a single file by hash. Prefer bulk_identify_hashes for multiple files."""
+    result = await bulk_identify_hashes(session, [file_hash])
+    if file_hash in result:
+        return result[file_hash].get("project_id")
+    return None
 
 
-async def get_latest_version_for_project(
+async def get_latest_version(
     session: aiohttp.ClientSession,
-    project_id: str,
+    id_or_slug: str,
     loaders: list[str],
     game_version: str,
 ) -> Optional[dict]:
+    """Get the latest version for a project by ID or slug, strict game_version match.
+    Prefers versions specifically built for game_version over ones that also target newer versions."""
     async with session.get(
-        f"{MODRINTH_API}/project/{project_id}/version",
+        f"{MODRINTH_API}/project/{id_or_slug}/version",
         params={
             "loaders":       json.dumps(loaders),
             "game_versions": json.dumps([game_version]),
@@ -364,28 +392,30 @@ async def get_latest_version_for_project(
         if resp.status != 200:
             return None
         versions = await resp.json()
-        releases = [v for v in versions if v.get("version_type") == "release"]
-        return releases[0] if releases else (versions[0] if versions else None)
-
-
-async def get_latest_version_for_slug(
-    session: aiohttp.ClientSession,
-    slug: str,
-    loaders: list[str],
-    game_version: str,
-) -> Optional[dict]:
-    async with session.get(
-        f"{MODRINTH_API}/project/{slug}/version",
-        params={
-            "loaders":       json.dumps(loaders),
-            "game_versions": json.dumps([game_version]),
-        },
-    ) as resp:
-        if resp.status != 200:
+        # Strict filter: only keep versions that explicitly list our exact game_version
+        exact = [v for v in versions if game_version in v.get("game_versions", [])]
+        if not exact:
             return None
-        versions = await resp.json()
-        releases = [v for v in versions if v.get("version_type") == "release"]
-        return releases[0] if releases else (versions[0] if versions else None)
+
+        # Prefer versions specifically built for our game_version
+        # (not ones that also target newer MC versions like 26.1.1 when we want 26.1)
+        try:
+            target_parts = tuple(int(x) for x in game_version.split("."))
+            def is_specific(v: dict) -> bool:
+                for gv in v.get("game_versions", []):
+                    try:
+                        if tuple(int(x) for x in gv.split(".")) > target_parts:
+                            return False  # also targets a newer MC version
+                    except ValueError:
+                        continue
+                return True
+            specific = [v for v in exact if is_specific(v)]
+        except ValueError:
+            specific = []
+
+        pool = specific if specific else exact
+        releases = [v for v in pool if v.get("version_type") == "release"]
+        return releases[0] if releases else (pool[0] if pool else None)
 
 
 async def fetch_latest_mc_version(session: aiohttp.ClientSession) -> Optional[str]:
@@ -438,7 +468,6 @@ async def process_content(
     label: str,
     files: list[Path],
     dest_folder: Path,
-    state_bucket: dict,
     removed_bucket: dict,
     game_version: str,
     loaders: Optional[list[str]] = None,
@@ -496,32 +525,22 @@ async def process_content(
             "version": new_ver_num, "filename": pf["filename"] if pf else name,
         }
 
-        if new_hash == h:
-            # Same hash — but verify the version actually targets our game_version
-            target_gvs = new_ver.get("game_versions", [])
-            if target_gvs and game_version not in target_gvs:
-                # Same file but Modrinth says it's for a different MC version
-                # Force re-download the correct version for our target
-                correct = await get_latest_version_for_project(
-                    session, project_id, loaders or [], game_version
-                )
-                if correct:
-                    cpf = get_primary_file(correct)
-                    if cpf and cpf["hashes"]["sha1"] != h:
-                        needs_update.append({
-                            "name": name, "old_path": path, "new_version": correct,
-                            "new_ver_num": correct.get("version_number", "?"),
-                            "project_id": project_id,
-                        })
-                        continue
-                up_to_date.append({"name": name, "version": new_ver_num})
-            else:
-                up_to_date.append({"name": name, "version": new_ver_num})
-        else:
-            needs_update.append({
-                "name": name, "old_path": path, "new_version": new_ver,
-                "new_ver_num": new_ver_num, "project_id": project_id,
-            })
+        # Always verify against get_latest_version which prefers
+        # version-specific builds (e.g. 0.144.4+26.1 over 0.145.2+26.1.1)
+        correct = await get_latest_version(
+            session, project_id, loaders or [], game_version
+        )
+        if correct:
+            cpf = get_primary_file(correct)
+            correct_hash = cpf["hashes"]["sha1"] if cpf else h
+            if correct_hash != h:
+                needs_update.append({
+                    "name": name, "old_path": path, "new_version": correct,
+                    "new_ver_num": correct.get("version_number", "?"),
+                    "project_id": project_id,
+                })
+                continue
+        up_to_date.append({"name": name, "version": new_ver_num})
 
     # ---- Deep-check: hashes not found in bulk update ----
     truly_unknown:    list[str]  = []
@@ -529,39 +548,53 @@ async def process_content(
 
     if no_result_hashes:
         log("info", f"Identifying {len(no_result_hashes)} unmatched file(s)...")
-        for h, path in no_result_hashes:
-            project_id = await identify_file_by_hash(session, h)
-            await asyncio.sleep(0.15)
+        # Bulk identify all unmatched hashes in one API call
+        all_hashes = [h for h, _ in no_result_hashes]
+        identified = await bulk_identify_hashes(session, all_hashes)
 
+        # For identified files, check compatibility in parallel
+        to_check = []
+        for h, path in no_result_hashes:
+            if h not in identified:
+                truly_unknown.append(path.name)
+                new_state[path.name] = {"hash": h, "filename": path.name}
+                continue
+            project_id = identified[h].get("project_id")
             if not project_id:
                 truly_unknown.append(path.name)
                 new_state[path.name] = {"hash": h, "filename": path.name}
                 continue
+            to_check.append((h, path, project_id))
 
-            compatible = await get_latest_version_for_project(
-                session, project_id, loaders or [], game_version
+        if to_check:
+            compat_results = await asyncio.gather(
+                *(get_latest_version(session, pid, loaders or [], game_version)
+                  for _, _, pid in to_check),
+                return_exceptions=True,
             )
-            await asyncio.sleep(0.15)
-
-            if compatible:
-                pf  = get_primary_file(compatible)
-                ver = compatible.get("version_number", "?")
-                needs_update.append({
-                    "name": path.name, "old_path": path, "new_version": compatible,
-                    "new_ver_num": ver, "project_id": project_id,
-                })
-            else:
-                incompatible_now.append({
-                    "name": path.name, "path": path,
-                    "hash": h, "project_id": project_id,
-                })
+            for (h, path, project_id), result in zip(to_check, compat_results):
+                compatible = result if isinstance(result, dict) else None
+                if compatible:
+                    pf  = get_primary_file(compatible)
+                    ver = compatible.get("version_number", "?")
+                    needs_update.append({
+                        "name": path.name, "old_path": path, "new_version": compatible,
+                        "new_ver_num": ver, "project_id": project_id,
+                    })
+                else:
+                    incompatible_now.append({
+                        "name": path.name, "path": path,
+                        "hash": h, "project_id": project_id,
+                    })
 
     # ---- Print status ----
     for m in up_to_date:
         log("ok", f"{m['name']}  ({m['version']})")
 
     for m in needs_update:
-        log("update", f"{m['name']}  → {m['new_ver_num']}")
+        item_downgrade = is_version_downgrade(m["name"], m["new_ver_num"])
+        icon = "down" if item_downgrade else "update"
+        log(icon, f"{m['name']}  → {m['new_ver_num']}")
 
     for name in truly_unknown:
         log("skip", f"{name}  (not on Modrinth — kept)")
@@ -569,17 +602,24 @@ async def process_content(
     # ---- Download updates ----
     if needs_update:
         print()
-        action_word = "Downgrading" if is_downgrade else "Downloading"
-        icon = "down" if is_downgrade else "info"
-        log(icon, f"{action_word} {len(needs_update)} update(s)...")
+        # Count downgrades vs upgrades for summary line
+        downgrades = sum(1 for m in needs_update if is_version_downgrade(m["name"], m["new_ver_num"]))
+        upgrades = len(needs_update) - downgrades
+        parts = []
+        if upgrades:
+            parts.append(f"{upgrades} update(s)")
+        if downgrades:
+            parts.append(f"{downgrades} downgrade(s)")
+        log("info", f"Downloading {', '.join(parts)}...")
         for i, item in enumerate(needs_update, 1):
             label_str = f"[{i}/{len(needs_update)}] {item['name']} → {item['new_ver_num']}"
+            item_downgrade = is_downgrade or is_version_downgrade(item["name"], item["new_ver_num"])
             if DRY_RUN:
                 log("skip", f"[DRY RUN] {label_str}")
                 continue
 
             # When downgrading mods, ask per mod before replacing
-            if is_downgrade and removal_mode == "priority":
+            if item_downgrade and removal_mode == "priority":
                 print(f"\n    {LOG_ICONS['down']}  {label_str}")
                 print(f"       This will downgrade to MC {game_version}.")
                 answer = input(f"       Downgrade this mod? (y/n): ").strip().lower()
@@ -591,7 +631,8 @@ async def process_content(
                     continue
                 print(f"    ⬇  {label_str} ... ", end="", flush=True)
             else:
-                print(f"    ↓  {label_str} ... ", end="", flush=True)
+                arrow = "⬇" if item_downgrade else "↓"
+                print(f"    {arrow}  {label_str} ... ", end="", flush=True)
 
             new_path = await download_file(session, item["new_version"], dest_folder)
             if new_path:
@@ -680,7 +721,7 @@ async def check_previously_removed(
 
     for project_id, info in removed_bucket.items():
         fname = info.get("filename", project_id)
-        compatible = await get_latest_version_for_project(
+        compatible = await get_latest_version(
             session, project_id, loaders, game_version
         )
         await asyncio.sleep(0.15)
@@ -722,14 +763,14 @@ async def process_priority_mods(
     """
     installed_ids = {v.get("project_id") for v in state_bucket.values() if v.get("project_id")}
 
-    # Also build installed project IDs by hashing every jar in the folder
-    # This catches mods not tracked in state (like manually added jars)
-    for jar in mods_path.glob("*.jar"):
-        h = sha1_file(jar)
-        pid = await identify_file_by_hash(session, h)
-        if pid:
-            installed_ids.add(pid)
-        await asyncio.sleep(0.05)
+    # Bulk identify all installed jars in one API call
+    jar_hashes = [sha1_file(jar) for jar in mods_path.glob("*.jar")]
+    if jar_hashes:
+        identified = await bulk_identify_hashes(session, jar_hashes)
+        for ver_data in identified.values():
+            pid = ver_data.get("project_id")
+            if pid:
+                installed_ids.add(pid)
 
     all_priority_slugs = [
         slug
@@ -737,10 +778,14 @@ async def process_priority_mods(
         for slug in MOD_PRIORITY.get(tier, [])
     ]
 
+    # Fetch all project info in parallel
+    results = await asyncio.gather(
+        *(get_project(session, slug) for slug in all_priority_slugs),
+        return_exceptions=True,
+    )
     missing_priority = []
-    for slug in all_priority_slugs:
-        info = await get_project(session, slug)
-        if not info:
+    for slug, info in zip(all_priority_slugs, results):
+        if not isinstance(info, dict) or "id" not in info:
             continue
         if info["id"] not in installed_ids:
             missing_priority.append((slug, info.get("title", slug), info["id"]))
@@ -751,7 +796,7 @@ async def process_priority_mods(
     section(f"Priority Mods — {len(missing_priority)} Not Installed")
 
     for i, (slug, title, _) in enumerate(missing_priority, 1):
-        latest = await get_latest_version_for_slug(session, slug, ["fabric"], game_version)
+        latest = await get_latest_version(session, slug, ["fabric"], game_version)
 
         if not latest:
             # No compatible version for current MC
@@ -798,6 +843,11 @@ async def process_pack_list(
 
     section(f"{pack_type.title()} List  ({len(slug_list)} configured)")
 
+    # Pre-compute hashes for all existing files once (avoid rehashing per slug)
+    existing_files = list(dest_folder.glob("*.zip")) + list(dest_folder.glob("*.jar"))
+    file_hashes: dict[Path, str] = {f: sha1_file(f) for f in existing_files}
+    installed_hashes: set[str] = set(file_hashes.values())
+
     for i, slug in enumerate(slug_list, 1):
         info = await get_project(session, slug)
         if not info:
@@ -807,7 +857,7 @@ async def process_pack_list(
         title = info.get("title", slug)
 
         # Try current game version first, fallback to any latest version
-        latest = await get_latest_version_for_slug(session, slug, [], game_version)
+        latest = await get_latest_version(session, slug, [], game_version)
         if not latest:
             # No version for current MC — get the absolute latest available
             async with session.get(f"{MODRINTH_API}/project/{slug}/version") as resp:
@@ -818,7 +868,6 @@ async def process_pack_list(
 
         if not latest:
             log("skip", f"[{i}/{len(slug_list)}] {title}  — no version on Modrinth")
-            await asyncio.sleep(0.15)
             continue
 
         pf = get_primary_file(latest)
@@ -829,17 +878,16 @@ async def process_pack_list(
         latest_hash = pf["hashes"]["sha1"]
         ver         = latest.get("version_number", "?")
 
-        # Check if this exact version is already installed (by hash)
-        already_installed = False
+        # Check if this exact version is already installed (by pre-computed hash)
+        already_installed = latest_hash in installed_hashes
         old_file: Optional[Path] = None
-        for existing in list(dest_folder.glob("*.zip")) + list(dest_folder.glob("*.jar")):
-            if sha1_file(existing) == latest_hash:
-                already_installed = True
-                break
+        if not already_installed:
             name_lower = title.lower().replace(" ", "").replace("-", "")
-            file_lower = existing.name.lower().replace(" ", "").replace("-", "")
-            if name_lower in file_lower:
-                old_file = existing
+            for existing, _ in file_hashes.items():
+                file_lower = existing.name.lower().replace(" ", "").replace("-", "")
+                if name_lower in file_lower:
+                    old_file = existing
+                    break
 
         if already_installed:
             log("ok", f"[{i}/{len(slug_list)}] {title}  ({ver})")
@@ -857,7 +905,11 @@ async def process_pack_list(
         new_path = await download_file(session, latest, dest_folder)
         if new_path:
             if old_file and old_file.exists() and old_file.name != new_path.name:
+                file_hashes.pop(old_file, None)
                 old_file.unlink()
+            # Update hash cache with the new file
+            file_hashes[new_path] = latest_hash
+            installed_hashes.add(latest_hash)
             print("done ✓")
         else:
             print("FAILED ✗")
@@ -956,7 +1008,7 @@ async def main():
                 label          = f"Fabric Mods  ({len(jar_files)} installed)",
                 files          = jar_files,
                 dest_folder    = mods_path,
-                state_bucket   = state.get("mods", {}),
+
                 removed_bucket = new_removed["mods"],
                 game_version   = game_version,
                 loaders        = ["fabric"],
@@ -982,7 +1034,6 @@ async def main():
                 label          = f"Resource Packs  ({len(rp_files)} installed)",
                 files          = rp_files,
                 dest_folder    = resourcepacks_path,
-                state_bucket   = state.get("resourcepacks", {}),
                 removed_bucket = {},
                 game_version   = game_version,
                 loaders        = None,
@@ -1029,7 +1080,7 @@ async def main():
                         label          = "",
                         files          = world_files,
                         dest_folder    = dp_folder,
-                        state_bucket   = state.get("datapacks", {}).get(world.name, {}),
+
                         removed_bucket = {},
                         game_version   = game_version,
                         loaders        = None,
@@ -1064,8 +1115,11 @@ async def main():
             final_jars = list(mods_path.glob("*.jar"))
             mismatched = []
 
-            for jar in final_jars:
-                h = sha1_file(jar)
+            # Bulk identify all jars in one API call
+            jar_hash_map = {sha1_file(jar): jar for jar in final_jars}
+            bulk_ver_data = await bulk_identify_hashes(session, list(jar_hash_map.keys()))
+
+            for h, jar in jar_hash_map.items():
                 meta = read_fabric_metadata(jar)
                 mod_name = meta.get("name", jar.name)
 
@@ -1075,18 +1129,14 @@ async def main():
                 mod_ver = meta.get("version", "?")
                 supports = ""
 
-                async with session.get(
-                    f"{MODRINTH_API}/version_file/{h}",
-                    params={"algorithm": "sha1"},
-                ) as resp:
-                    if resp.status == 200:
-                        ver_data = await resp.json()
-                        gvs = ver_data.get("game_versions", [])
-                        project_id = ver_data.get("project_id")
-                        mod_ver = ver_data.get("version_number", mod_ver)
-                        if gvs and game_version not in gvs:
-                            modrinth_mismatch = True
-                            supports = ", ".join(gvs[:3]) + ("..." if len(gvs) > 3 else "")
+                ver_data = bulk_ver_data.get(h)
+                if ver_data:
+                    gvs = ver_data.get("game_versions", [])
+                    project_id = ver_data.get("project_id")
+                    mod_ver = ver_data.get("version_number", mod_ver)
+                    if gvs and game_version not in gvs:
+                        modrinth_mismatch = True
+                        supports = ", ".join(gvs[:3]) + ("..." if len(gvs) > 3 else "")
 
                 # Check 2: fabric.mod.json depends.minecraft
                 fabric_mismatch = False
@@ -1110,8 +1160,6 @@ async def main():
                         "project_id": project_id, "hash": h,
                     })
 
-                await asyncio.sleep(0.08)
-
             if not mismatched:
                 log("ok", f"All {len(final_jars)} mods are compatible with MC {game_version}")
             else:
@@ -1130,7 +1178,7 @@ async def main():
                     if not pid:
                         log("skip", f"{m['name']}  — can't identify on Modrinth")
                         continue
-                    correct = await get_latest_version_for_project(
+                    correct = await get_latest_version(
                         session, pid, ["fabric"], game_version
                     )
                     if correct:
@@ -1167,15 +1215,16 @@ async def main():
     })
 
     # Save run history to database.json
-    added   = [f for f in mods_after if f not in mods_before]
-    removed = [f for f in mods_before if f not in mods_after]
+    set_before, set_after = set(mods_before), set(mods_after)
+    added   = set_after - set_before
+    removed = set_before - set_after
     save_run_to_db(
         game_version       = game_version,
         mods_before        = sorted(mods_before),
         mods_after         = sorted(mods_after),
-        updated            = sorted(set(added) & set(removed)),  # files that were swapped
-        removed            = sorted(set(removed) - set(added)),
-        installed          = sorted(set(added) - set(removed)),
+        updated            = sorted(added & removed),
+        removed            = sorted(removed - added),
+        installed          = sorted(added - removed),
         cross_check_fixed  = [],  # populated above if cross-check ran
     )
 
